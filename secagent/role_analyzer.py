@@ -421,7 +421,9 @@ def regex_construct_to_z3_expr(regex_construct) -> z3.ReRef:
         _, _, _, value = node_value
         return regex_to_z3_expr(value)
     elif sre_constants.ANY == node_type:  # .
-        return AnyChar()
+        # Python's '.' matches any character except a newline; re.DOTALL, which
+        # lifts that, is rejected in regex_to_z3_expr_search.
+        return Minus(AnyChar(), z3.Re("\n"))
     elif sre_constants.MAX_REPEAT == node_type:
         low, high, value = node_value
         if (0, 1) == (low, high):  # a?
@@ -512,6 +514,78 @@ def regex_to_z3_expr(regex: sre_parse.SubPattern) -> z3.ReRef:
         return z3.Concat(
             [regex_construct_to_z3_expr(construct) for construct in regex.data]
         )
+
+
+# Flags that change what the constructs above mean: re.DOTALL lets '.' match a
+# newline, re.MULTILINE moves ^ and $ to line boundaries, and the rest change
+# what literals and categories match. None of them are modelled.
+UNSUPPORTED_REGEX_FLAGS = re.DOTALL | re.MULTILINE | re.IGNORECASE | re.ASCII | re.LOCALE
+
+
+def regex_to_z3_expr_search(pattern: str) -> z3.ReRef:
+    """
+    Translates a regex into the Z3 equivalent of the language Python's
+    `re.search` accepts for it, which is what jsonschema enforces for the
+    "pattern" keyword.
+
+    `regex_to_z3_expr` builds a whole-string match, so modelling "pattern" with
+    it describes a strictly narrower language than the one enforced at runtime.
+    Here an unanchored side is wrapped in `.*` instead, and an anchor that pins
+    a side is consumed:
+
+      ^, \\A  pin the start.
+      \\Z     pins the end.
+      $       pins the end, but also matches just before a single newline at the
+              end of the string, so it leaves an optional trailing newline.
+
+    An anchor anywhere else (an interior ^ or $, \\b, \\B) still raises
+    NotImplementedError from regex_construct_to_z3_expr. A caller must read that
+    as "the language could not be determined", never as an empty language.
+    """
+    parsed = sre_parse.parse(pattern)
+    flags = parsed.state.flags
+    if flags & UNSUPPORTED_REGEX_FLAGS:
+        raise NotImplementedError(
+            f"ERROR: regex flags {flags:#x} in {pattern} not implemented"
+        )
+    data = list(parsed.data)
+
+    anchored_start = False
+    while data and sre_constants.AT == data[0][0] and data[0][1] in {
+        sre_constants.AT_BEGINNING,
+        sre_constants.AT_BEGINNING_STRING,
+    }:
+        anchored_start = True
+        data.pop(0)
+
+    end_anchors = []
+    while data and sre_constants.AT == data[-1][0] and data[-1][1] in {
+        sre_constants.AT_END,
+        sre_constants.AT_END_STRING,
+    }:
+        end_anchors.append(data.pop()[1])
+    anchored_end = 0 < len(end_anchors)
+    # '$' tolerates a newline at the very end, '\Z' does not, so a '\Z' among
+    # them pins the end exactly.
+    allows_trailing_newline = (
+        anchored_end and sre_constants.AT_END_STRING not in end_anchors
+    )
+
+    parts = []
+    if not anchored_start:
+        parts.append(z3.Star(AnyChar()))
+    parts.extend(regex_construct_to_z3_expr(construct) for construct in data)
+    if allows_trailing_newline:
+        parts.append(z3.Option(z3.Re("\n")))
+    if not anchored_end:
+        parts.append(z3.Star(AnyChar()))
+
+    if 0 == len(parts):  # '^$' and '\A\Z' accept the empty string only.
+        return z3.Re("")
+    elif 1 == len(parts):
+        return parts[0]
+    else:
+        return z3.Concat(parts)
 
 
 def matches_value(

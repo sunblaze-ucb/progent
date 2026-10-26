@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from z3 import *
-from .role_analyzer import regex_to_z3_expr
-import sre_parse
+from .role_analyzer import regex_to_z3_expr_search
+import sys
 
 # Define a global Z3 datatype for null.
 NullType = Datatype('NullType')
@@ -179,7 +179,9 @@ def build_constraints(var, schema):
     if var.sort() == StringSort():
         if "pattern" in schema:
             pat = schema["pattern"]
-            regex = regex_to_z3_expr(sre_parse.parse(pat))
+            # jsonschema enforces "pattern" with re.search, so the language
+            # modelled here is the searched one, not a whole-string match.
+            regex = regex_to_z3_expr_search(pat)
             constraint = And(constraint, InRe(var, regex))
         if "minLength" in schema:
             constraint = And(constraint, Length(var) >= schema["minLength"])
@@ -230,11 +232,19 @@ def build_constraints(var, schema):
     return constraint
 
 
+SOLVER_SAT = "sat"
+SOLVER_UNSAT = "unsat"
+SOLVER_UNDECIDED = "undecided"
+
+
 def solve_schema(schema):
     """
     Given a JSON Schema (as a dict), determine if there is a value that satisfies it.
     Chooses a top-level Z3 variable based on the schema's "type" or by inferring from an "enum".
-    Returns a tuple (model, var) if satisfiable, or (None, var) if unsat.
+    Returns (SOLVER_SAT, model, var) when a satisfying value was found,
+    (SOLVER_UNSAT, None, var) when there is provably none, and
+    (SOLVER_UNDECIDED, None, var) when no candidate type could be built, the
+    solver timed out, or the schema used a construct that cannot be translated.
     """
     var_list = []
     # Determine the top-level type.
@@ -315,18 +325,30 @@ def solve_schema(schema):
             for aw in ARRAY_WRAPPERS:
                 var_list.append(Const('x', aw))
 
+    undecided = False
+    var = None
     for var in var_list:
         try:
             cons = build_constraints(var, schema)
             s = Solver()
             s.add(cons)
             s.set("timeout", 5000)
-            if s.check() == sat:
+            result = s.check()
+            if result == sat:
                 model = s.model()
-                return model, var
+                return SOLVER_SAT, model, var
+            if result == unknown:
+                undecided = True
+                print(f"solve_schema: solver gave up on {var.sort()}: {s.reason_unknown()}", file=sys.stderr)
         except Exception as e:
-            pass
-    return None, var
+            # An untranslatable regex or an unsupported keyword leaves this
+            # branch unproved; it does not make the branch unsatisfiable.
+            undecided = True
+            print(f"solve_schema: cannot decide {var.sort()}: {e}", file=sys.stderr)
+    if var is None:
+        # No candidate type matched the schema, so nothing was ever checked.
+        undecided = True
+    return (SOLVER_UNDECIDED if undecided else SOLVER_UNSAT), None, var
 
 
 def security_policy_analysis(security_policy):
@@ -348,9 +370,11 @@ def security_policy_analysis(security_policy):
                                     restriction_2
                                 ]
                             }
-                            model, var = solve_schema(schema)
-                            if model:
+                            status, model, var = solve_schema(schema)
+                            if status == SOLVER_SAT:
                                 warnings.append(f"Policy Warning: {restriction_1} and {restriction_2} overlap. Possible value: {model[var]}.")
+                            elif status == SOLVER_UNDECIDED:
+                                warnings.append(f"Policy Warning: cannot determine whether {restriction_1} and {restriction_2} overlap.")
     return warnings
 
 
@@ -361,6 +385,10 @@ def security_policy_subset_check(ori_policy, new_policy):
     ori_policy_filtered = {tool: policies for tool, policies in ori_policy_filtered.items() if len(policies) > 0}
     new_policy_filtered = {tool: policies for tool, policies in new_policy_filtered.items() if len(policies) > 0}
     print(ori_policy_filtered, new_policy_filtered, file=sys.stderr)
+    for tool, policies in list(ori_policy_filtered.items()) + list(new_policy_filtered.items()):
+        if len(policies) > 1:
+            print(f"Tool '{tool}' has {len(policies)} generated policy entries, expected one.", file=sys.stderr)
+            return False
     for tool, new_policies in new_policy_filtered.items():
         if tool not in ori_policy_filtered:
             return False
@@ -415,9 +443,13 @@ def security_policy_subset_check(ori_policy, new_policy):
                 if var_type is not None:
                     schema["type"] = var_type
                     print("Found type:", var_type, file=sys.stderr)
-                model, var = solve_schema(schema)
-                if model:
+                status, model, var = solve_schema(schema)
+                if status == SOLVER_SAT:
                     print(f"Found counter example: {model[var]}", file=sys.stderr)
+                    return False
+                if status != SOLVER_UNSAT:
+                    # Containment was not proved, so it cannot be assumed.
+                    print(f"Cannot prove {restriction_2} is a subset of {restriction_1}.", file=sys.stderr)
                     return False
             else:
                 if restriction_1 != restriction_2:
