@@ -132,6 +132,25 @@ def value_to_z3(sort, value):
     return scalar_to_z3(sort, value)
 
 
+def json_type_name(value):
+    """
+    Return the JSON Schema type name of a JSON value.
+    """
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if value is None:
+        return "null"
+    if isinstance(value, list):
+        return "array"
+    return "object"
+
+
 def make_array_from_list(lst, ArrayWrapper):
     """
     Given a Python list and an element type (one of "string", "integer", "number", "boolean", "null"),
@@ -470,7 +489,7 @@ def security_policy_subset_check(ori_policy, new_policy):
     Limitations:
       - Type changes are not detected by default. The counter example search
         is limited to the type of the original restriction (its "type", or the
-        type of its first enum value), so a new restriction that also admits
+        types of the enum and const values), so a new restriction that also admits
         values of another type, e.g. {"type": "string", "enum": ["a"]} ->
         {"type": "integer"}, passes. Set SECAGENT_SUBSET_CHECK_ALL_TYPES=true
         to search values of every type instead. That mode is stricter: a
@@ -524,34 +543,19 @@ def security_policy_subset_check(ori_policy, new_policy):
                         var_type = restriction_1["type"]
                     elif "type" in restriction_2:
                         var_type = restriction_2["type"]
-                    elif "enum" in restriction_1 and len(restriction_1["enum"]) > 0:
-                        first = restriction_1["enum"][0]
-                        if isinstance(first, list):
-                            var_type = "array"
-                        if isinstance(first, str):
-                            var_type = "string"
-                        elif isinstance(first, int):
-                            var_type = "integer"
-                        elif isinstance(first, float):
-                            var_type = "number"
-                        elif isinstance(first, bool):
-                            var_type = "boolean"
-                        elif first is None:
-                            var_type = "null"
-                    elif "enum" in restriction_2 and len(restriction_2["enum"]) > 0:
-                        first = restriction_2["enum"][0]
-                        if isinstance(first, list):
-                            var_type = "array"
-                        if isinstance(first, str):
-                            var_type = "string"
-                        elif isinstance(first, int):
-                            var_type = "integer"
-                        elif isinstance(first, float):
-                            var_type = "number"
-                        elif isinstance(first, bool):
-                            var_type = "boolean"
-                        elif first is None:
-                            var_type = "null"
+                    else:
+                        # Without a "type", search the types of all enum and const
+                        # values on both sides. {"enum": [None, "a"]} ->
+                        # {"enum": [None, "b"]} must be rejected, which requires
+                        # searching strings as well as null.
+                        values = []
+                        for restriction in (restriction_1, restriction_2):
+                            values.extend(restriction.get("enum", []))
+                            if "const" in restriction:
+                                values.append(restriction["const"])
+                        value_types = sorted({json_type_name(v) for v in values})
+                        if value_types:
+                            var_type = value_types
                     if var_type is not None:
                         schema["type"] = var_type
                         print("Found type:", var_type, file=sys.stderr)
